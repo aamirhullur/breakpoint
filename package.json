@@ -1,0 +1,52 @@
+{
+  "name": "breakpoint",
+  "displayName": "Breakpoint",
+  "version": "0.1.0",
+  "description": "Multi-viewport Chrome extension for responsive design testing.",
+  "author": "Aamir Hullur",
+  "scripts": {
+    "dev": "plasmo dev",
+    "build": "plasmo build",
+    "package": "plasmo package",
+    "typecheck": "tsc --noEmit",
+    "lint": "prettier --check .",
+    "format": "prettier --write ."
+  },
+  "dependencies": {
+    "lucide-react": "0.561.0",
+    "plasmo": "0.90.5",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "zod": "4.1.13"
+  },
+  "devDependencies": {
+    "@ianvs/prettier-plugin-sort-imports": "4.7.0",
+    "@types/bun": "1.3.4",
+    "@types/chrome": "0.1.32",
+    "@types/node": "25.0.2",
+    "@types/react": "19.2.7",
+    "@types/react-dom": "19.2.3",
+    "prettier": "3.7.4",
+    "typescript": "5.9.3"
+  },
+  "manifest": {
+    "action": {
+      "default_popup": "popup.html",
+      "default_title": "Breakpoint"
+    },
+    "background": {
+      "service_worker": "background.js",
+      "type": "module"
+    },
+    "permissions": [
+      "storage",
+      "tabs",
+      "windows",
+      "debugger"
+    ],
+    "host_permissions": [
+      "https://*/*",
+      "http://*/*"
+    ]
+  }
+}
