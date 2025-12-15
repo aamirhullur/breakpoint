@@ -184,15 +184,15 @@ const createPreviewWindow = async (): Promise<number> => {
     // ignore
   }
 
-  // Important: a minimized window can cause Chromium to stop painting, which makes
-  // CDP screenshots hang. Instead we create an unfocused popup off-screen.
+  // Important:
+  // - A minimized window can cause Chromium to stop painting, which makes CDP screenshots hang.
+  // - Chrome/Brave require window bounds to be mostly on-screen (can't fully place off-screen).
+  // So we create a small, unfocused popup that stays on-screen and immediately restore focus.
   const win = await chrome.windows.create({
     focused: false,
     type: "popup",
-    width: 800,
-    height: 600,
-    left: -10000,
-    top: -10000,
+    width: 520,
+    height: 420,
     url: "about:blank"
   })
 
@@ -201,7 +201,7 @@ const createPreviewWindow = async (): Promise<number> => {
   }
 
   try {
-    await chrome.windows.update(win.id, { focused: false, left: -10000, top: -10000 })
+    await chrome.windows.update(win.id, { focused: false })
   } catch {
     // ignore
   }
@@ -223,7 +223,40 @@ const ensureDeviceTabs = async (
 ): Promise<Map<DevicePresetId, DeviceRuntime>> => {
   const devices = new Map<DevicePresetId, DeviceRuntime>()
 
-  for (const deviceId of session.devices) {
+  const deviceIds = session.devices.filter((deviceId) => Boolean(DEVICE_BY_ID[deviceId]))
+  if (!deviceIds.length) {
+    return devices
+  }
+
+  // Reuse the initial tab created with the window to avoid tab-removal races.
+  const existingTabs = await chrome.tabs.query({ windowId })
+  const hostTabId =
+    existingTabs.find((tab) => tab.active && tab.id)?.id ??
+    existingTabs.find((tab) => tab.id)?.id
+
+  if (!hostTabId) {
+    return devices
+  }
+
+  const firstDeviceId = deviceIds[0]
+  const firstPreset = DEVICE_BY_ID[firstDeviceId]
+  if (firstPreset) {
+    try {
+      await chrome.tabs.update(hostTabId, { url: session.url })
+    } catch {
+      // ignore
+    }
+
+    devices.set(firstDeviceId, {
+      deviceId: firstDeviceId,
+      tabId: hostTabId,
+      preset: firstPreset,
+      attached: false,
+      initialized: false
+    })
+  }
+
+  for (const deviceId of deviceIds.slice(1)) {
     const preset = DEVICE_BY_ID[deviceId]
     if (!preset) continue
     const tab = await chrome.tabs.create({
@@ -239,17 +272,6 @@ const ensureDeviceTabs = async (
       attached: false,
       initialized: false
     })
-  }
-
-  // Remove the initial about:blank tab (if present)
-  try {
-    const tabs = await chrome.tabs.query({ windowId })
-    const blankTabs = tabs.filter((t) => t.url === "about:blank" && t.id)
-    if (blankTabs.length) {
-      await chrome.tabs.remove(blankTabs.map((t) => t.id!) as number[])
-    }
-  } catch {
-    // ignore
   }
 
   return devices
@@ -426,54 +448,92 @@ chrome.runtime.onConnect.addListener((port) => {
   if (!sessionId) return
 
   port.onMessage.addListener(async (raw) => {
-    const message = raw as MirrorMessageFromUi
-    if (message.type === "mirror/start") {
-      try {
-        if (sessions.has(sessionId)) {
-          await stopSession(sessionId)
-        }
+    try {
+      const message = raw as MirrorMessageFromUi
+      if (message.type === "mirror/start") {
+        try {
+          if (sessions.has(sessionId)) {
+            await stopSession(sessionId)
+          }
 
-        const previewWindowId = await createPreviewWindow()
-        const devices = await ensureDeviceTabs(message.session, previewWindowId)
+          const previewWindowId = await createPreviewWindow()
+          const devices = await ensureDeviceTabs(
+            message.session,
+            previewWindowId
+          )
 
-        if (!devices.size) {
-          throw new Error("No device tabs were created")
-        }
+          if (!devices.size) {
+            throw new Error("No device tabs were created")
+          }
 
-        const runtime: SessionRuntime = {
-          session: message.session,
-          port,
-          previewWindowId,
-          devices,
-          captureTimer: null,
-          isStopping: false,
-          isTicking: false
-        }
+          const runtime: SessionRuntime = {
+            session: message.session,
+            port,
+            previewWindowId,
+            devices,
+            captureTimer: null,
+            isStopping: false,
+            isTicking: false
+          }
 
-        sessions.set(sessionId, runtime)
-        startCaptureLoop(runtime)
-        return
-      } catch (error) {
-        // Best-effort error propagation.
-        for (const deviceId of message.session.devices) {
-          postToUi(port, {
-            type: "mirror/status",
-            sessionId,
-            deviceId,
-            status: "error",
-            message: error instanceof Error ? error.message : "Failed to start mirroring"
-          })
+          sessions.set(sessionId, runtime)
+          startCaptureLoop(runtime)
+          return
+        } catch (error) {
+          // Best-effort error propagation.
+          for (const deviceId of message.session.devices) {
+            postToUi(port, {
+              type: "mirror/status",
+              sessionId,
+              deviceId,
+              status: "error",
+              message:
+                error instanceof Error
+                  ? error.message
+                  : "Failed to start mirroring"
+            })
+          }
+          return
         }
+      }
+
+      const runtime = sessions.get(sessionId)
+      if (!runtime) return
+      await handleUiMessage(runtime, message)
+    } catch (error) {
+      console.error("[responsive-view] port message failed", error)
+
+      const runtime = sessions.get(sessionId)
+      const deviceId = (raw as any)?.deviceId as DevicePresetId | undefined
+
+      if (runtime && deviceId) {
+        postToUi(runtime.port, {
+          type: "mirror/status",
+          sessionId: runtime.session.id,
+          deviceId,
+          status: "error",
+          message: error instanceof Error ? error.message : "Unexpected error"
+        })
         return
       }
-    }
 
-    const runtime = sessions.get(sessionId)
-    if (!runtime) return
-    await handleUiMessage(runtime, message)
+      if (runtime) {
+        for (const id of runtime.session.devices) {
+          postToUi(runtime.port, {
+            type: "mirror/status",
+            sessionId: runtime.session.id,
+            deviceId: id,
+            status: "error",
+            message: error instanceof Error ? error.message : "Unexpected error"
+          })
+        }
+      }
+    }
   })
 
   port.onDisconnect.addListener(() => {
-    void stopSession(sessionId)
+    stopSession(sessionId).catch((error) => {
+      console.error("[responsive-view] stopSession failed", error)
+    })
   })
 })
